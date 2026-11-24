@@ -49,7 +49,7 @@ export type ScanProgress = {
 };
 
 export type EmailTemplate = {
-  step: 1 | 2 | 3;
+  kind: 'step_1' | 'step_2' | 'step_3' | 'comeback';
   subject: string;
   bodyMarkdown: string;
 };
@@ -60,7 +60,7 @@ export type ProviderPreset = {
   cutoffAt: Date | null;
   /** Trademark / non-affiliation lines. */
   disclaimers: string[];
-  /** Steps 1–3. */
+  /** Steps 1–3 and the come-back reminder. */
   defaultEmailTemplates: EmailTemplate[];
   landingCopy: Record<string, string>;
 };
@@ -85,42 +85,88 @@ export interface SourceProvider {
     onProgress?: (progress: ScanProgress) => void,
     signal?: AbortSignal,
   ): AsyncIterable<SourceSubscription>;
-  /** Present iff capabilities.supportsLiveRefresh. Milestone 2. */
+  /** Present iff capabilities.supportsLiveRefresh. */
   refresh?(creds: SourceCredentials, sourceSubscriptionId: string): Promise<SourceSubscription>;
-  /** Present iff capabilities.supportsApiCancel. Milestone 3. */
+  /** Present iff capabilities.supportsApiCancel. Must confirm the cancel took effect (re-read) or throw. */
   cancel?(creds: SourceCredentials, sourceSubscriptionId: string): Promise<void>;
 }
 
-// --- Milestone 2 / 3 interfaces. Declared now so the names are final; no implementation yet. ---
+// --- Destination (Milestone 2) -------------------------------------------------------------
+
+export type DestCredentials = { apiKey: string };
 
 export type DestPlan = {
   priceId: string;
   productName: string;
+  /** Minor units; null for tiered or custom prices. */
   unitAmount: number | null;
   currency: string;
   interval: { unit: IntervalUnit; count: number };
+  /** Managed Payments needs an eligible tax code on the product. */
+  taxCode: string | null;
+};
+
+export type DryRunMapping = {
+  priceId: string;
+  priceInterval: { unit: IntervalUnit; count: number };
+  couponId: string | null;
+  automaticTax: boolean;
+};
+
+export type CheckoutInput = {
+  destMode: 'stripe_managed' | 'stripe_standard';
+  automaticTax: boolean;
+  priceId: string;
+  priceInterval: { unit: IntervalUnit; count: number };
+  quantity: number;
+  couponId: string | null;
+  token: string;
+  appUrl: string;
+  customerEmail: string;
+  metadata: {
+    migration_token: string;
+    source_provider: string;
+    source_subscription_id: string;
+    source_customer_id: string;
+    campaign_id: string;
+  };
+  state: SourceState;
+  paidThrough: Date | null;
+  resolvedStrategy: 'anchor' | 'trial' | null;
+  /** Sessions already created for this subscriber with the same deferral target. */
+  attempt: number;
+  now: Date;
 };
 
 export interface DestinationProvider {
   /** 'stripe' */
   id: string;
-  validateCredentials(creds: unknown): Promise<{ ok: boolean; livemode: boolean; error?: string }>;
-  listPlans(creds: unknown): Promise<DestPlan[]>;
-  findCustomerByEmail(creds: unknown, email: string): Promise<string | null>;
-  dryRun(creds: unknown, mapping: unknown, mode: string): Promise<{ ok: boolean; strategy?: string; error?: string }>;
+  validateCredentials(creds: DestCredentials): Promise<{ ok: boolean; livemode: boolean; error?: string }>;
+  listPlans(creds: DestCredentials): Promise<DestPlan[]>;
+  findCustomerByEmail(creds: DestCredentials, email: string): Promise<string | null>;
+  dryRun(
+    creds: DestCredentials,
+    mapping: DryRunMapping,
+    mode: 'stripe_managed' | 'stripe_standard',
+  ): Promise<{ ok: boolean; strategy?: string; error?: string }>;
   createCheckout(
-    creds: unknown,
-    input: unknown,
+    creds: DestCredentials,
+    input: CheckoutInput,
   ): Promise<{ sessionId: string; url: string; expiresAt: Date; strategy: string; deferralUntil: Date | null }>;
   getCheckout(
-    creds: unknown,
+    creds: DestCredentials,
     sessionId: string,
   ): Promise<{
     status: 'open' | 'complete' | 'expired';
     destSubscriptionId?: string;
     destCustomerId?: string;
     subscriptionStatus?: string;
+    clientReferenceId?: string;
+    /** Present while the session is open, so it can be reused. */
+    url?: string;
   }>;
+  /** The new subscription, checked before the old one is cancelled automatically (BRIEF 5.6). Null if missing. */
+  getSubscription(creds: DestCredentials, subscriptionId: string): Promise<{ status: string; metadata: Record<string, string> } | null>;
 }
 
 export type EmailMessage = {
@@ -133,12 +179,17 @@ export type EmailMessage = {
   headers?: Record<string, string>;
 };
 
+export type EmailCredentials = { apiKey: string };
+
 export interface EmailProvider {
   /** 'resend' */
   id: string;
   send(
-    creds: unknown,
+    creds: EmailCredentials,
     message: EmailMessage,
     idempotencyKey: string,
-  ): Promise<{ ok: true } | { ok: false; retryTomorrow: boolean; error: string }>;
+  ): Promise<
+    | { ok: true }
+    | { ok: false; retryTomorrow: boolean; error: string; auth?: boolean; rateLimited?: boolean; monthlyQuota?: boolean }
+  >;
 }

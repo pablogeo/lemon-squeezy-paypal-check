@@ -19,7 +19,8 @@ export type LsErrorKind =
   | 'bad_request'
   | 'bad_response'
   | 'aborted'
-  | 'foreign_host';
+  | 'foreign_host'
+  | 'not_cancelled';
 
 export class LsApiError extends Error {
   readonly kind: LsErrorKind;
@@ -60,6 +61,8 @@ export type LsClientOptions = {
 
 export type LsClient = {
   getJson(pathOrUrl: string, signal?: AbortSignal): Promise<unknown>;
+  /** DELETE (cancel). Same timeouts, retries and host pinning as GET. */
+  deleteJson(pathOrUrl: string, signal?: AbortSignal): Promise<unknown>;
   paginate(firstPath: string, signal?: AbortSignal): AsyncGenerator<LsListBody>;
 };
 
@@ -90,13 +93,13 @@ export function createLsClient(apiKey: string, options: LsClientOptions = {}): L
     Authorization: `Bearer ${apiKey}`,
   };
 
-  async function attempt(url: string, signal?: AbortSignal): Promise<{ status: number; text: string; remaining: number | null }> {
+  async function attempt(url: string, signal?: AbortSignal, method: 'GET' | 'DELETE' = 'GET'): Promise<{ status: number; text: string; remaining: number | null }> {
     const ctrl = new AbortController();
     const onAbort = () => ctrl.abort();
     signal?.addEventListener('abort', onAbort, { once: true });
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const res = await fetchImpl(url, { method: 'GET', headers, signal: ctrl.signal, redirect: 'error' });
+      const res = await fetchImpl(url, { method, headers, signal: ctrl.signal, redirect: 'error' });
       const text = await res.text();
       const remainingHeader = res.headers.get('x-ratelimit-remaining');
       const remaining = remainingHeader !== null && remainingHeader !== '' ? Number(remainingHeader) : null;
@@ -107,7 +110,7 @@ export function createLsClient(apiKey: string, options: LsClientOptions = {}): L
     }
   }
 
-  async function getJson(pathOrUrl: string, signal?: AbortSignal): Promise<unknown> {
+  async function getJson(pathOrUrl: string, signal?: AbortSignal, method: 'GET' | 'DELETE' = 'GET'): Promise<unknown> {
     const url = resolveLsUrl(pathOrUrl);
     let rateLimited = 0;
     let transient = 0;
@@ -116,7 +119,7 @@ export function createLsClient(apiKey: string, options: LsClientOptions = {}): L
       if (signal?.aborted) throw abortedError();
       let result: Awaited<ReturnType<typeof attempt>>;
       try {
-        result = await attempt(url, signal);
+        result = await attempt(url, signal, method);
       } catch {
         if (signal?.aborted) throw abortedError();
         if (transient < maxTransientRetries) {
@@ -179,7 +182,7 @@ export function createLsClient(apiKey: string, options: LsClientOptions = {}): L
     }
   }
 
-  return { getJson, paginate };
+  return { getJson: (p, sig) => getJson(p, sig), deleteJson: (p, sig) => getJson(p, sig, 'DELETE'), paginate };
 }
 
 /** Only the short JSON:API error title, never the full body. */

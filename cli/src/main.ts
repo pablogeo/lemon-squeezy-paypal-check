@@ -1,10 +1,12 @@
 // Lemon Squeezy PayPal subscriber check: command-line version.
 // Bundled into one unminified file with zero runtime dependencies (Node.js 18+).
-// It talks only to https://api.lemonsqueezy.com, never writes the API key to disk, and never
-// contacts our server. (The `cancel` command arrives in a later release.)
-import { writeFileSync } from 'node:fs';
+// It talks only to https://api.lemonsqueezy.com (and api.stripe.com, only to verify a cancel when
+// you give it your restricted key), never writes an API key to disk, and never contacts our server.
+import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { createInterface } from 'node:readline';
 import { BRAND_NAME, CLI_FILE_NAME, CLI_VERSION, SITE_URL } from '@/config/brand';
+import { parseCancelList, type CancelListItem, type CancelResultItem, type CancelResultsFile } from '@/core/cancel-files';
 import { CheckAbortedError, runCheck } from '@/core/checker';
 import { writeExport } from '@/core/export-file/write';
 import { formatDate, formatMoney, formatPct, NEEDS_REVIEW_LABELS } from '@/core/format';
@@ -19,11 +21,16 @@ const HELP = `Lemon Squeezy PayPal subscriber check (${BRAND_NAME} CLI v${CLI_VE
 Usage:
   node ${CLI_FILE_NAME} [check] [--json]
   node ${CLI_FILE_NAME} export [--out stranded.json] [--store <id>]
+  node ${CLI_FILE_NAME} cancel cancel-list.json [--yes] [--no-verify] [--out cancel-results.json]
 
 Commands:
   check     (default) print the report: PayPal subscribers, revenue at stake, renewals by week.
             Nothing leaves your machine.
   export    write the stranded subscribers of one store to a file you upload to your campaign.
+  cancel    cancel the old subscriptions of customers who already re-subscribed, from the
+            cancel-list.json your dashboard gives you. Each one is re-checked with Lemon Squeezy
+            (and with Stripe when STRIPE_API_KEY holds your restricted key) before anything is
+            deleted, and you confirm the final list. Writes cancel-results.json to upload.
 
 The API key is read from LEMONSQUEEZY_API_KEY, or asked for at a hidden prompt. It is never
 written to disk. Lemon Squeezy keys are full-access: create a dedicated key, delete it afterwards.
@@ -32,24 +39,43 @@ Options:
   --json        (check) print the report as JSON
   --out <file>  (export) where to write the file, default stranded.json
   --store <id>  (export) which store, when the key can see more than one
+  --yes         (cancel) skip the confirmation prompt
+  --no-verify   (cancel) proceed without checking Stripe (not recommended)
+  --out <file>  (cancel) where to write the results, default cancel-results.json
   --help        show this help
   --version     show the version
 `;
 
-type Args = { command: 'check' | 'export'; json: boolean; out: string; store: string | null };
+type Args = {
+  command: 'check' | 'export' | 'cancel';
+  json: boolean;
+  out: string;
+  store: string | null;
+  file: string | null;
+  yes: boolean;
+  noVerify: boolean;
+};
 
 class UsageError extends Error {}
 
 function parseArgs(argv: string[]): Args | 'help' | 'version' {
-  const args: Args = { command: 'check', json: false, out: 'stranded.json', store: null };
+  const args: Args = { command: 'check', json: false, out: 'stranded.json', store: null, file: null, yes: false, noVerify: false };
   const rest = [...argv];
-  if (rest[0] === 'check' || rest[0] === 'export') args.command = rest.shift() as Args['command'];
+  if (rest[0] === 'check' || rest[0] === 'export' || rest[0] === 'cancel') args.command = rest.shift() as Args['command'];
+  if (args.command === 'cancel') args.out = 'cancel-results.json';
   while (rest.length) {
     const a = rest.shift()!;
     if (a === '--help' || a === '-h' || a === 'help') return 'help';
     if (a === '--version') return 'version';
     if (a === '--json' && args.command === 'check') args.json = true;
-    else if ((a === '--out' || a === '--store') && args.command === 'export') {
+    else if (args.command === 'cancel' && a === '--yes') args.yes = true;
+    else if (args.command === 'cancel' && a === '--no-verify') args.noVerify = true;
+    else if (args.command === 'cancel' && !a.startsWith('--') && !args.file) args.file = a;
+    else if (args.command === 'cancel' && a === '--out') {
+      const v = rest.shift();
+      if (!v || v.startsWith('--')) throw new UsageError('--out needs a value');
+      args.out = v;
+    } else if ((a === '--out' || a === '--store') && args.command === 'export') {
       const v = rest.shift();
       if (!v || v.startsWith('--')) throw new UsageError(`${a} needs a value`);
       if (a === '--out') args.out = v;
@@ -249,6 +275,152 @@ async function runExportCommand(source: SourceProvider, apiKey: string, args: Ar
   return 0;
 }
 
+const PAYPAL_FLAGGED = new Set(['paused', 'unpaid']);
+
+/** Reads the customer's new Stripe subscription: it must be active or trialing and point back at this LS subscription. */
+async function verifyStripe(stripeKey: string, item: CancelListItem): Promise<string | null> {
+  try {
+    const res = await fetch(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(item.destSubscriptionId)}`, {
+      headers: { Authorization: `Bearer ${stripeKey}` },
+      signal: AbortSignal.timeout(15_000),
+    });
+    const body = (await res.json().catch(() => null)) as {
+      status?: string;
+      metadata?: Record<string, string>;
+      error?: { message?: string };
+    } | null;
+    if (!res.ok) return `Stripe: ${body?.error?.message ?? `HTTP ${res.status}`}`;
+    if (body?.status !== 'active' && body?.status !== 'trialing') return `Stripe subscription is ${body?.status ?? 'unknown'}`;
+    if (body.metadata?.source_subscription_id !== item.sourceSubscriptionId) {
+      return 'Stripe subscription belongs to another Lemon Squeezy subscription';
+    }
+    return null;
+  } catch {
+    return 'Could not reach Stripe';
+  }
+}
+
+async function confirm(question: string): Promise<boolean> {
+  if (!process.stdin.isTTY) return false;
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  const answer = await new Promise<string>((done) => rl.question(question, done));
+  rl.close();
+  return /^y(es)?$/i.test(answer.trim());
+}
+
+async function runCancelCommand(source: SourceProvider, apiKey: string, args: Args): Promise<number> {
+  if (!args.file) {
+    process.stderr.write('Pass the cancel-list.json your dashboard gave you: cancel cancel-list.json\n');
+    return 2;
+  }
+  let text: string;
+  try {
+    text = readFileSync(resolve(args.file), 'utf8');
+  } catch {
+    process.stderr.write(`Cannot read ${args.file}\n`);
+    return 2;
+  }
+  const parsed = parseCancelList(text);
+  if (!parsed.ok) {
+    process.stderr.write(`${parsed.error}\n`);
+    return 2;
+  }
+  const list = parsed.file;
+  const stripeKey = process.env.STRIPE_API_KEY?.trim() ?? '';
+  if (stripeKey && !/^rk_(live|test)_/.test(stripeKey)) {
+    process.stderr.write('STRIPE_API_KEY must be a restricted key (rk_…). Secret keys are refused.\n');
+    return 2;
+  }
+  if (!stripeKey && !args.noVerify) {
+    process.stderr.write(
+      "Without STRIPE_API_KEY the CLI cannot check that each customer's new Stripe subscription is active.\n" +
+        'Set STRIPE_API_KEY to your restricted key, or pass --no-verify to continue without that check.\n',
+    );
+    return 2;
+  }
+  if (!stripeKey) process.stderr.write('Warning: not verifying with Stripe (--no-verify).\n');
+
+  const creds = { apiKey };
+  const results: CancelResultItem[] = [];
+  const toCancel: Array<{ item: CancelListItem; overlap: boolean }> = [];
+  for (const item of list.items) {
+    const skip = (reason: string) => results.push({ sourceSubscriptionId: item.sourceSubscriptionId, outcome: 'skipped', reason, overlap: false });
+    let live: SourceSubscription;
+    try {
+      live = await source.refresh!(creds, item.sourceSubscriptionId);
+    } catch (err) {
+      const kind = err instanceof Error && 'kind' in err ? (err as { kind: unknown }).kind : null;
+      if (kind === 'auth') throw err;
+      if (kind === 'not_found') skip('missing in Lemon Squeezy');
+      else {
+        results.push({
+          sourceSubscriptionId: item.sourceSubscriptionId,
+          outcome: 'failed',
+          reason: err instanceof Error ? err.message : 'read failed',
+          overlap: false,
+        });
+      }
+      continue;
+    }
+    if (live.state === 'cancelled_in_grace' || live.state === 'ended') {
+      skip('already cancelled');
+      continue;
+    }
+    if (!live.stranded && !PAYPAL_FLAGGED.has(live.needsReview ?? '')) {
+      skip('not a PayPal subscription');
+      continue;
+    }
+    if (live.email.trim().toLowerCase() !== item.email.trim().toLowerCase()) {
+      skip('email differs from the list');
+      continue;
+    }
+    if (stripeKey) {
+      const problem = await verifyStripe(stripeKey, item);
+      if (problem) {
+        skip(problem);
+        continue;
+      }
+    }
+    // The old platform renewed after the cancel-by date: still cancel, and flag it for a refund.
+    const overlap = live.paidThrough !== null && live.paidThrough.getTime() > Date.parse(item.cancelBy);
+    toCancel.push({ item, overlap });
+  }
+
+  const lines = [`Campaign ${list.campaignId}: ${toCancel.length} to cancel, ${results.length} skipped or failed.`, ''];
+  for (const t of toCancel) {
+    lines.push(
+      `  cancel   ${t.item.email}  ${t.item.productName}  (cancel by ${formatDate(t.item.cancelBy)})${t.overlap ? '  [already renewed: refund the latest payment]' : ''}`,
+    );
+  }
+  for (const r of results) lines.push(`  ${r.outcome.padEnd(7)}  ${r.sourceSubscriptionId}  ${r.reason ?? ''}`);
+  process.stdout.write(`${lines.join('\n')}\n\n`);
+
+  if (toCancel.length && !args.yes && !(await confirm(`Cancel these ${toCancel.length} Lemon Squeezy subscriptions? [y/N] `))) {
+    process.stderr.write('Nothing cancelled.\n');
+    return 1;
+  }
+  for (const t of toCancel) {
+    try {
+      await source.cancel!(creds, t.item.sourceSubscriptionId);
+      results.push({ sourceSubscriptionId: t.item.sourceSubscriptionId, outcome: 'cancelled', overlap: t.overlap });
+    } catch (err) {
+      results.push({
+        sourceSubscriptionId: t.item.sourceSubscriptionId,
+        outcome: 'failed',
+        reason: err instanceof Error ? err.message : 'cancel failed',
+        overlap: t.overlap,
+      });
+    }
+  }
+  const out: CancelResultsFile = { schemaVersion: 1, campaignId: list.campaignId, completedAt: new Date().toISOString(), items: results };
+  const outPath = resolve(args.out);
+  writeFileSync(outPath, `${JSON.stringify(out, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  const done = results.filter((r) => r.outcome === 'cancelled').length;
+  const failed = results.filter((r) => r.outcome === 'failed').length;
+  process.stdout.write(`Cancelled ${done}, failed ${failed}. Wrote ${outPath}\nUpload it in your campaign at ${SITE_URL} so the dashboard knows.\n`);
+  return failed ? 1 : 0;
+}
+
 function storeList(accounts: SourceAccount[]): string {
   return accounts.map((a) => `  ${a.id}  ${a.name}${a.currency ? ` (${a.currency})` : ''}\n`).join('');
 }
@@ -288,6 +460,7 @@ async function main(): Promise<number> {
   const source = createLemonSqueezySource();
 
   try {
+    if (args.command === 'cancel') return await runCancelCommand(source, apiKey, args);
     return args.command === 'export'
       ? await runExportCommand(source, apiKey, args, ctrl.signal)
       : await runCheckCommand(source, apiKey, args.json, ctrl.signal);

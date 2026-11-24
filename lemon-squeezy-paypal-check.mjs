@@ -1,16 +1,17 @@
 #!/usr/bin/env node
-// Lemon Squeezy PayPal subscriber check v0.2.1. MIT License.
-// Single file, no dependencies. Talks only to https://api.lemonsqueezy.com.
+// Lemon Squeezy PayPal subscriber check v0.3.0. MIT License.
+// Single file, no dependencies. Talks only to https://api.lemonsqueezy.com (and api.stripe.com, read-only, to verify cancels).
 
 // cli/src/main.ts
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { createInterface } from "node:readline";
 
 // src/config/cli.json
 var cli_default = {
   packageName: "lemon-squeezy-paypal-check",
   fileName: "lemon-squeezy-paypal-check.mjs",
-  version: "0.2.1",
+  version: "0.3.0",
   npmPublished: false
 };
 
@@ -19,6 +20,31 @@ var BRAND_NAME = "ReLink";
 var SITE_URL = "https://relinkpay.com";
 var CLI_FILE_NAME = cli_default.fileName;
 var CLI_VERSION = cli_default.version;
+
+// src/core/cancel-files.ts
+var CANCEL_SCHEMA_VERSION = 1;
+var MAX_CANCEL_FILE_BYTES = 10 * 1024 * 1024;
+var isObj = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+var str = (v, max = 320) => typeof v === "string" && v.length > 0 && v.length <= max;
+var iso = (v) => typeof v === "string" && !Number.isNaN(Date.parse(v));
+function parseCancelList(text) {
+  if (text.length > MAX_CANCEL_FILE_BYTES) return { ok: false, error: "The file is larger than 10 MB." };
+  let v;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    return { ok: false, error: "The file is not JSON." };
+  }
+  if (!isObj(v) || v.schemaVersion !== CANCEL_SCHEMA_VERSION || !str(v.campaignId, 64) || !iso(v.generatedAt) || !Array.isArray(v.items)) {
+    return { ok: false, error: "This is not a cancel list from the dashboard." };
+  }
+  for (const [i, it] of v.items.entries()) {
+    if (!isObj(it) || !str(it.sourceSubscriptionId, 128) || !str(it.email) || !str(it.productName, 500) || !str(it.destSubscriptionId, 255) || !iso(it.cancelBy)) {
+      return { ok: false, error: `Item ${i + 1} is incomplete.` };
+    }
+  }
+  return { ok: true, file: v };
+}
 
 // src/core/mrr.ts
 var MONTHLY_FACTOR = {
@@ -436,13 +462,13 @@ function createLsClient(apiKey, options = {}) {
     "Content-Type": "application/vnd.api+json",
     Authorization: `Bearer ${apiKey}`
   };
-  async function attempt(url, signal) {
+  async function attempt(url, signal, method = "GET") {
     const ctrl = new AbortController();
     const onAbort = () => ctrl.abort();
     signal?.addEventListener("abort", onAbort, { once: true });
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const res = await fetchImpl(url, { method: "GET", headers, signal: ctrl.signal, redirect: "error" });
+      const res = await fetchImpl(url, { method, headers, signal: ctrl.signal, redirect: "error" });
       const text = await res.text();
       const remainingHeader = res.headers.get("x-ratelimit-remaining");
       const remaining = remainingHeader !== null && remainingHeader !== "" ? Number(remainingHeader) : null;
@@ -452,7 +478,7 @@ function createLsClient(apiKey, options = {}) {
       signal?.removeEventListener("abort", onAbort);
     }
   }
-  async function getJson(pathOrUrl, signal) {
+  async function getJson(pathOrUrl, signal, method = "GET") {
     const url = resolveLsUrl(pathOrUrl);
     let rateLimited = 0;
     let transient = 0;
@@ -460,7 +486,7 @@ function createLsClient(apiKey, options = {}) {
       if (signal?.aborted) throw abortedError();
       let result;
       try {
-        result = await attempt(url, signal);
+        result = await attempt(url, signal, method);
       } catch {
         if (signal?.aborted) throw abortedError();
         if (transient < maxTransientRetries) {
@@ -519,7 +545,7 @@ function createLsClient(apiKey, options = {}) {
       next = body.next;
     }
   }
-  return { getJson, paginate };
+  return { getJson: (p, sig) => getJson(p, sig), deleteJson: (p, sig) => getJson(p, sig, "DELETE"), paginate };
 }
 function errorTitle(text) {
   try {
@@ -627,22 +653,24 @@ var lemonSqueezyPreset = {
   disclaimers: ["Not affiliated with Lemon Squeezy, Stripe, or PayPal."],
   // Merge tags: {{customer_name}} {{product_name}} {{variant_name}} {{renews_at_formatted}}
   // {{cutoff_date_formatted}} {{resub_url}} {{store_name}} {{support_email}}.
-  // Milestone 3 adds the per-subscriber "no charge today" line (only when true) and, in
-  // stripe_managed mode, the line saying checkout and receipts come from Link.
+  // Conditional blocks keep each email factual for its reader: {{#if deferred}} (no charge today),
+  // {{#if charged_now}} (the old payment failed) and {{#if link}} (Managed Payments: Link).
   defaultEmailTemplates: [
     {
-      step: 1,
+      kind: "step_1",
       subject: "Action needed to keep your {{product_name}} subscription",
       bodyMarkdown: [
         "Hi {{customer_name}},",
         "",
-        "You pay for {{product_name}} ({{variant_name}}) with PayPal through Lemon Squeezy. Lemon Squeezy stops processing payments on {{cutoff_date_formatted}}, and PayPal subscriptions cannot be moved to the new payment system. Without a new subscription, your plan will not renew after that date.",
+        "You pay for {{product_name}} ({{variant_name}}) with PayPal through Lemon Squeezy. PayPal billing through Lemon Squeezy ends on {{cutoff_date_formatted}}, and PayPal subscriptions cannot be moved to the new payment system. Without a new subscription, your plan will not renew after that date.",
         "",
         "This personal link keeps your plan and your renewal date:",
         "",
         "{{resub_url}}",
         "",
-        "It takes about a minute. Your next payment stays on {{renews_at_formatted}}, the same day as now.",
+        "{{#if deferred}}It takes about a minute. No charge today: your next payment stays on {{renews_at_formatted}}, the same day as now.{{/if}}{{#if charged_now}}It takes about a minute. Your last payment did not go through, so the new subscription starts with a payment today.{{/if}}",
+        "",
+        "{{#if link}}Checkout and receipts come from Link, Stripe's checkout service.{{/if}}",
         "",
         "Questions? Reply to this email or write to {{support_email}}.",
         "",
@@ -650,7 +678,7 @@ var lemonSqueezyPreset = {
       ].join("\n")
     },
     {
-      step: 2,
+      kind: "step_2",
       subject: "Reminder: your {{product_name}} subscription needs a new payment method",
       bodyMarkdown: [
         "Hi {{customer_name}},",
@@ -659,13 +687,15 @@ var lemonSqueezyPreset = {
         "",
         "Your personal link keeps your plan and renewal date: {{resub_url}}",
         "",
+        "{{#if deferred}}No charge today: your next payment stays on {{renews_at_formatted}}.{{/if}}",
+        "",
         "Questions? Write to {{support_email}}.",
         "",
         "{{store_name}}"
       ].join("\n")
     },
     {
-      step: 3,
+      kind: "step_3",
       subject: "Last notice: PayPal billing for {{product_name}} ends {{cutoff_date_formatted}}",
       bodyMarkdown: [
         "Hi {{customer_name}},",
@@ -673,6 +703,23 @@ var lemonSqueezyPreset = {
         "This is the last reminder. PayPal billing for {{product_name}} through Lemon Squeezy ends on {{cutoff_date_formatted}}. After that, your subscription will not renew.",
         "",
         "Keep your plan and renewal date here: {{resub_url}}",
+        "",
+        "Questions? Write to {{support_email}}.",
+        "",
+        "{{store_name}}"
+      ].join("\n")
+    },
+    {
+      kind: "comeback",
+      subject: "Your {{product_name}} link is ready to use now",
+      bodyMarkdown: [
+        "Hi {{customer_name}},",
+        "",
+        "Your billing period has just renewed, so your personal link can line up your new subscription now:",
+        "",
+        "{{resub_url}}",
+        "",
+        "{{#if deferred}}No charge today: your next payment stays on {{renews_at_formatted}}.{{/if}}",
         "",
         "Questions? Write to {{support_email}}.",
         "",
@@ -723,6 +770,70 @@ var lemonSqueezyPreset = {
 
 // src/core/providers/lemon-squeezy/source.ts
 var LEMON_SQUEEZY_ID = "lemon_squeezy";
+async function softFail(fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof LsApiError && (err.kind === "auth" || err.kind === "aborted")) throw err;
+    return null;
+  }
+}
+function newestPrice(prices) {
+  const candidates = prices.some((p) => p.category === "subscription") ? prices.filter((p) => p.category === "subscription") : prices;
+  let best = null;
+  for (const p of candidates) {
+    const tp = p.createdAt?.getTime() ?? -Infinity;
+    const tb = best?.createdAt?.getTime() ?? -Infinity;
+    if (best === null || tp > tb || tp === tb && Number(p.id) > Number(best.id)) best = p;
+  }
+  return best;
+}
+async function resolvePrice(client, sub, cache, signal) {
+  let priceId = sub.firstItem?.priceId ?? null;
+  let price = null;
+  if (sub.firstItem && priceId) {
+    const id = priceId;
+    let p = cache.byId.get(id);
+    if (!p) {
+      p = softFail(async () => parsePrice(asSingleData(await client.getJson(`/v1/prices/${encodeURIComponent(id)}`, signal))));
+      cache.byId.set(id, p);
+    }
+    price = await p;
+  } else if (!sub.firstItem && sub.variantId) {
+    const variantId = sub.variantId;
+    let p = cache.byVariant.get(variantId);
+    if (!p) {
+      p = softFail(async () => {
+        const found = [];
+        for await (const page of client.paginate(`/v1/prices?filter[variant_id]=${encodeURIComponent(variantId)}&page[size]=100`, signal)) {
+          for (const item of page.data) {
+            const pr = parsePrice(item);
+            if (pr) found.push(pr);
+          }
+        }
+        return newestPrice(found);
+      });
+      cache.byVariant.set(variantId, p);
+    }
+    price = await p;
+    priceId = price?.id ?? null;
+  }
+  return { price, priceId, quantity: sub.firstItem?.quantity ?? 1 };
+}
+async function storeCurrency(client, accountId, signal) {
+  try {
+    const store = parseStore(asSingleData(await client.getJson(`/v1/stores/${encodeURIComponent(accountId)}`, signal)));
+    return store?.currency ?? null;
+  } catch (err) {
+    if (err instanceof LsApiError && err.kind === "not_found") return null;
+    throw err;
+  }
+}
+async function readSubscription(client, id, signal) {
+  const sub = parseSubscription(asSingleData(await client.getJson(`/v1/subscriptions/${encodeURIComponent(id)}`, signal)));
+  if (!sub) throw new LsApiError("bad_response", "Lemon Squeezy returned an unreadable subscription.");
+  return sub;
+}
 function createLemonSqueezySource(options = {}) {
   const now = options.now ?? (() => /* @__PURE__ */ new Date());
   const clientFor = (creds) => createLsClient(creds.apiKey, { fetch: options.fetch, sleep: options.sleep, timeoutMs: options.timeoutMs });
@@ -743,39 +854,37 @@ function createLemonSqueezySource(options = {}) {
     },
     scan(creds, accountId, onProgress, signal) {
       return scanStore(clientFor(creds), accountId, now(), onProgress, signal);
+    },
+    /** One subscription, live (connected mode at click time, the CLI before cancelling). */
+    async refresh(creds, sourceSubscriptionId) {
+      const client = clientFor(creds);
+      const signal = AbortSignal.timeout(options.timeoutMs ?? 5e3);
+      const sub = await readSubscription(client, sourceSubscriptionId, signal);
+      const { price, priceId, quantity } = await resolvePrice(client, sub, { byId: /* @__PURE__ */ new Map(), byVariant: /* @__PURE__ */ new Map() }, signal);
+      const currency = await storeCurrency(client, sub.storeId, signal);
+      return normalizeSubscription({ sub, price, priceId, quantity, currency, now: now() });
+    },
+    /**
+     * DELETE, then read the subscription back: it counts as cancelled only if Lemon Squeezy now
+     * shows it cancelled. (Its docs do not say whether DELETE works for PayPal subscriptions, so
+     * the result is never assumed; see docs/API_NOTES.md.)
+     */
+    async cancel(creds, sourceSubscriptionId) {
+      const client = clientFor(creds);
+      await client.deleteJson(`/v1/subscriptions/${encodeURIComponent(sourceSubscriptionId)}`);
+      const after = await readSubscription(client, sourceSubscriptionId);
+      if (!after.cancelled && after.status !== "cancelled" && after.status !== "expired") {
+        throw new LsApiError(
+          "not_cancelled",
+          "Lemon Squeezy did not cancel this subscription. Cancel it by hand in the Lemon Squeezy dashboard."
+        );
+      }
     }
   };
 }
 async function* scanStore(client, accountId, scanNow, onProgress, signal) {
   const currency = await storeCurrency(client, accountId, signal);
-  const priceById = /* @__PURE__ */ new Map();
-  const newestPriceByVariant = /* @__PURE__ */ new Map();
-  const lookupPrice = (priceId) => {
-    let p = priceById.get(priceId);
-    if (!p) {
-      p = softFail(async () => parsePrice(asSingleData(await client.getJson(`/v1/prices/${encodeURIComponent(priceId)}`, signal))));
-      priceById.set(priceId, p);
-    }
-    return p;
-  };
-  const lookupNewestVariantPrice = (variantId) => {
-    let p = newestPriceByVariant.get(variantId);
-    if (!p) {
-      p = softFail(async () => {
-        const found = [];
-        const path2 = `/v1/prices?filter[variant_id]=${encodeURIComponent(variantId)}&page[size]=100`;
-        for await (const page of client.paginate(path2, signal)) {
-          for (const item of page.data) {
-            const price = parsePrice(item);
-            if (price) found.push(price);
-          }
-        }
-        return newestPrice(found);
-      });
-      newestPriceByVariant.set(variantId, p);
-    }
-    return p;
-  };
+  const cache = { byId: /* @__PURE__ */ new Map(), byVariant: /* @__PURE__ */ new Map() };
   let pagesFetched = 0;
   let skippedRows = 0;
   const path = `/v1/subscriptions?filter[store_id]=${encodeURIComponent(accountId)}&page[size]=100`;
@@ -791,57 +900,10 @@ async function* scanStore(client, accountId, scanNow, onProgress, signal) {
     for (const sub of rows) {
       const { stranded, needsReview } = classify(sub);
       const wantsPrice = !sub.testMode && (stranded || needsReview !== null);
-      let priceId = sub.firstItem?.priceId ?? null;
-      let price = null;
-      if (wantsPrice) {
-        if (sub.firstItem && priceId) {
-          price = await lookupPrice(priceId);
-        } else if (!sub.firstItem && sub.variantId) {
-          price = await lookupNewestVariantPrice(sub.variantId);
-          priceId = price?.id ?? null;
-        }
-      }
-      yield normalizeSubscription({
-        sub,
-        price,
-        priceId,
-        quantity: sub.firstItem?.quantity ?? 1,
-        currency,
-        now: scanNow
-      });
+      const resolved = wantsPrice ? await resolvePrice(client, sub, cache, signal) : { price: null, priceId: sub.firstItem?.priceId ?? null, quantity: sub.firstItem?.quantity ?? 1 };
+      yield normalizeSubscription({ sub, ...resolved, currency, now: scanNow });
     }
   }
-}
-async function storeCurrency(client, accountId, signal) {
-  try {
-    const store = parseStore(asSingleData(await client.getJson(`/v1/stores/${encodeURIComponent(accountId)}`, signal)));
-    return store?.currency ?? null;
-  } catch (err) {
-    if (err instanceof LsApiError && err.kind === "not_found") return null;
-    throw err;
-  }
-}
-async function softFail(fn) {
-  try {
-    return await fn();
-  } catch (err) {
-    if (err instanceof LsApiError && (err.kind === "auth" || err.kind === "aborted")) throw err;
-    return null;
-  }
-}
-function newestPrice(prices) {
-  const candidates = prices.some((p) => p.category === "subscription") ? prices.filter((p) => p.category === "subscription") : prices;
-  let best = null;
-  for (const p of candidates) {
-    if (best === null || compareNewest(p, best) > 0) best = p;
-  }
-  return best;
-}
-function compareNewest(a, b) {
-  const ta = a.createdAt?.getTime() ?? -Infinity;
-  const tb = b.createdAt?.getTime() ?? -Infinity;
-  if (ta !== tb) return ta - tb;
-  return Number(a.id) - Number(b.id);
 }
 
 // cli/src/main.ts
@@ -851,11 +913,16 @@ var HELP = `Lemon Squeezy PayPal subscriber check (${BRAND_NAME} CLI v${CLI_VERS
 Usage:
   node ${CLI_FILE_NAME} [check] [--json]
   node ${CLI_FILE_NAME} export [--out stranded.json] [--store <id>]
+  node ${CLI_FILE_NAME} cancel cancel-list.json [--yes] [--no-verify] [--out cancel-results.json]
 
 Commands:
   check     (default) print the report: PayPal subscribers, revenue at stake, renewals by week.
             Nothing leaves your machine.
   export    write the stranded subscribers of one store to a file you upload to your campaign.
+  cancel    cancel the old subscriptions of customers who already re-subscribed, from the
+            cancel-list.json your dashboard gives you. Each one is re-checked with Lemon Squeezy
+            (and with Stripe when STRIPE_API_KEY holds your restricted key) before anything is
+            deleted, and you confirm the final list. Writes cancel-results.json to upload.
 
 The API key is read from LEMONSQUEEZY_API_KEY, or asked for at a hidden prompt. It is never
 written to disk. Lemon Squeezy keys are full-access: create a dedicated key, delete it afterwards.
@@ -864,21 +931,32 @@ Options:
   --json        (check) print the report as JSON
   --out <file>  (export) where to write the file, default stranded.json
   --store <id>  (export) which store, when the key can see more than one
+  --yes         (cancel) skip the confirmation prompt
+  --no-verify   (cancel) proceed without checking Stripe (not recommended)
+  --out <file>  (cancel) where to write the results, default cancel-results.json
   --help        show this help
   --version     show the version
 `;
 var UsageError = class extends Error {
 };
 function parseArgs(argv) {
-  const args = { command: "check", json: false, out: "stranded.json", store: null };
+  const args = { command: "check", json: false, out: "stranded.json", store: null, file: null, yes: false, noVerify: false };
   const rest = [...argv];
-  if (rest[0] === "check" || rest[0] === "export") args.command = rest.shift();
+  if (rest[0] === "check" || rest[0] === "export" || rest[0] === "cancel") args.command = rest.shift();
+  if (args.command === "cancel") args.out = "cancel-results.json";
   while (rest.length) {
     const a = rest.shift();
     if (a === "--help" || a === "-h" || a === "help") return "help";
     if (a === "--version") return "version";
     if (a === "--json" && args.command === "check") args.json = true;
-    else if ((a === "--out" || a === "--store") && args.command === "export") {
+    else if (args.command === "cancel" && a === "--yes") args.yes = true;
+    else if (args.command === "cancel" && a === "--no-verify") args.noVerify = true;
+    else if (args.command === "cancel" && !a.startsWith("--") && !args.file) args.file = a;
+    else if (args.command === "cancel" && a === "--out") {
+      const v = rest.shift();
+      if (!v || v.startsWith("--")) throw new UsageError("--out needs a value");
+      args.out = v;
+    } else if ((a === "--out" || a === "--store") && args.command === "export") {
       const v = rest.shift();
       if (!v || v.startsWith("--")) throw new UsageError(`${a} needs a value`);
       if (a === "--out") args.out = v;
@@ -1064,6 +1142,145 @@ ${storeList(accounts)}`
   );
   return 0;
 }
+var PAYPAL_FLAGGED = /* @__PURE__ */ new Set(["paused", "unpaid"]);
+async function verifyStripe(stripeKey, item) {
+  try {
+    const res = await fetch(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(item.destSubscriptionId)}`, {
+      headers: { Authorization: `Bearer ${stripeKey}` },
+      signal: AbortSignal.timeout(15e3)
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) return `Stripe: ${body?.error?.message ?? `HTTP ${res.status}`}`;
+    if (body?.status !== "active" && body?.status !== "trialing") return `Stripe subscription is ${body?.status ?? "unknown"}`;
+    if (body.metadata?.source_subscription_id !== item.sourceSubscriptionId) {
+      return "Stripe subscription belongs to another Lemon Squeezy subscription";
+    }
+    return null;
+  } catch {
+    return "Could not reach Stripe";
+  }
+}
+async function confirm(question) {
+  if (!process.stdin.isTTY) return false;
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  const answer = await new Promise((done) => rl.question(question, done));
+  rl.close();
+  return /^y(es)?$/i.test(answer.trim());
+}
+async function runCancelCommand(source, apiKey, args) {
+  if (!args.file) {
+    process.stderr.write("Pass the cancel-list.json your dashboard gave you: cancel cancel-list.json\n");
+    return 2;
+  }
+  let text;
+  try {
+    text = readFileSync(resolve(args.file), "utf8");
+  } catch {
+    process.stderr.write(`Cannot read ${args.file}
+`);
+    return 2;
+  }
+  const parsed = parseCancelList(text);
+  if (!parsed.ok) {
+    process.stderr.write(`${parsed.error}
+`);
+    return 2;
+  }
+  const list = parsed.file;
+  const stripeKey = process.env.STRIPE_API_KEY?.trim() ?? "";
+  if (stripeKey && !/^rk_(live|test)_/.test(stripeKey)) {
+    process.stderr.write("STRIPE_API_KEY must be a restricted key (rk_\u2026). Secret keys are refused.\n");
+    return 2;
+  }
+  if (!stripeKey && !args.noVerify) {
+    process.stderr.write(
+      "Without STRIPE_API_KEY the CLI cannot check that each customer's new Stripe subscription is active.\nSet STRIPE_API_KEY to your restricted key, or pass --no-verify to continue without that check.\n"
+    );
+    return 2;
+  }
+  if (!stripeKey) process.stderr.write("Warning: not verifying with Stripe (--no-verify).\n");
+  const creds = { apiKey };
+  const results = [];
+  const toCancel = [];
+  for (const item of list.items) {
+    const skip = (reason) => results.push({ sourceSubscriptionId: item.sourceSubscriptionId, outcome: "skipped", reason, overlap: false });
+    let live;
+    try {
+      live = await source.refresh(creds, item.sourceSubscriptionId);
+    } catch (err) {
+      const kind = err instanceof Error && "kind" in err ? err.kind : null;
+      if (kind === "auth") throw err;
+      if (kind === "not_found") skip("missing in Lemon Squeezy");
+      else {
+        results.push({
+          sourceSubscriptionId: item.sourceSubscriptionId,
+          outcome: "failed",
+          reason: err instanceof Error ? err.message : "read failed",
+          overlap: false
+        });
+      }
+      continue;
+    }
+    if (live.state === "cancelled_in_grace" || live.state === "ended") {
+      skip("already cancelled");
+      continue;
+    }
+    if (!live.stranded && !PAYPAL_FLAGGED.has(live.needsReview ?? "")) {
+      skip("not a PayPal subscription");
+      continue;
+    }
+    if (live.email.trim().toLowerCase() !== item.email.trim().toLowerCase()) {
+      skip("email differs from the list");
+      continue;
+    }
+    if (stripeKey) {
+      const problem = await verifyStripe(stripeKey, item);
+      if (problem) {
+        skip(problem);
+        continue;
+      }
+    }
+    const overlap = live.paidThrough !== null && live.paidThrough.getTime() > Date.parse(item.cancelBy);
+    toCancel.push({ item, overlap });
+  }
+  const lines = [`Campaign ${list.campaignId}: ${toCancel.length} to cancel, ${results.length} skipped or failed.`, ""];
+  for (const t of toCancel) {
+    lines.push(
+      `  cancel   ${t.item.email}  ${t.item.productName}  (cancel by ${formatDate(t.item.cancelBy)})${t.overlap ? "  [already renewed: refund the latest payment]" : ""}`
+    );
+  }
+  for (const r of results) lines.push(`  ${r.outcome.padEnd(7)}  ${r.sourceSubscriptionId}  ${r.reason ?? ""}`);
+  process.stdout.write(`${lines.join("\n")}
+
+`);
+  if (toCancel.length && !args.yes && !await confirm(`Cancel these ${toCancel.length} Lemon Squeezy subscriptions? [y/N] `)) {
+    process.stderr.write("Nothing cancelled.\n");
+    return 1;
+  }
+  for (const t of toCancel) {
+    try {
+      await source.cancel(creds, t.item.sourceSubscriptionId);
+      results.push({ sourceSubscriptionId: t.item.sourceSubscriptionId, outcome: "cancelled", overlap: t.overlap });
+    } catch (err) {
+      results.push({
+        sourceSubscriptionId: t.item.sourceSubscriptionId,
+        outcome: "failed",
+        reason: err instanceof Error ? err.message : "cancel failed",
+        overlap: t.overlap
+      });
+    }
+  }
+  const out = { schemaVersion: 1, campaignId: list.campaignId, completedAt: (/* @__PURE__ */ new Date()).toISOString(), items: results };
+  const outPath = resolve(args.out);
+  writeFileSync(outPath, `${JSON.stringify(out, null, 2)}
+`, { encoding: "utf8", mode: 384 });
+  const done = results.filter((r) => r.outcome === "cancelled").length;
+  const failed = results.filter((r) => r.outcome === "failed").length;
+  process.stdout.write(`Cancelled ${done}, failed ${failed}. Wrote ${outPath}
+Upload it in your campaign at ${SITE_URL} so the dashboard knows.
+`);
+  return failed ? 1 : 0;
+}
 function storeList(accounts) {
   return accounts.map((a) => `  ${a.id}  ${a.name}${a.currency ? ` (${a.currency})` : ""}
 `).join("");
@@ -1103,6 +1320,7 @@ ${HELP}`);
   process.once("SIGINT", () => ctrl.abort());
   const source = createLemonSqueezySource();
   try {
+    if (args.command === "cancel") return await runCancelCommand(source, apiKey, args);
     return args.command === "export" ? await runExportCommand(source, apiKey, args, ctrl.signal) : await runCheckCommand(source, apiKey, args.json, ctrl.signal);
   } catch (err) {
     if (process.stderr.isTTY) process.stderr.write("\n");

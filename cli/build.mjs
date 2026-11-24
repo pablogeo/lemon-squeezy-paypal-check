@@ -1,6 +1,7 @@
 // Bundles the CLI into one unminified ESM file with zero runtime dependencies, then:
 // - fails if the bundle pulls in any npm package or imports anything but Node built-ins,
-// - fails if it names any host other than api.lemonsqueezy.com (and the site URL it prints),
+// - fails if it names any host other than api.lemonsqueezy.com, api.stripe.com (cancel verification)
+//   and the site URL it prints,
 // - writes cli/dist/package.json (name and version from src/config/cli.json), README and LICENSE,
 //   so `npm publish cli/dist` publishes exactly the audited file,
 // - computes the SHA-256 the README and the site publish (src/config/cli-release.json,
@@ -24,10 +25,14 @@ function writeIfChanged(path, content) {
   if (!existsSync(path) || readFileSync(path, 'utf8') !== content) writeFileSync(path, content);
 }
 
-export async function buildCli({ site = false } = {}) {
+/**
+ * `outfile` lets a test bundle to its own path (parallel test files must not race on cli/dist);
+ * only the default path writes the release metadata.
+ */
+export async function buildCli({ site = false, outfile: target = outfile } = {}) {
   const result = await build({
     entryPoints: [join(root, 'cli', 'src', 'main.ts')],
-    outfile,
+    outfile: target,
     bundle: true,
     platform: 'node',
     format: 'esm',
@@ -41,7 +46,7 @@ export async function buildCli({ site = false } = {}) {
       js: [
         '#!/usr/bin/env node',
         `// Lemon Squeezy PayPal subscriber check v${cfg.version}. MIT License.`,
-        '// Single file, no dependencies. Talks only to https://api.lemonsqueezy.com.',
+        '// Single file, no dependencies. Talks only to https://api.lemonsqueezy.com (and api.stripe.com, read-only, to verify cancels).',
       ].join('\n'),
     },
     logLevel: 'warning',
@@ -50,17 +55,19 @@ export async function buildCli({ site = false } = {}) {
   const fromPackages = Object.keys(result.metafile.inputs).filter((p) => p.includes('node_modules'));
   if (fromPackages.length) throw new Error(`CLI bundle includes npm packages: ${fromPackages.join(', ')}`);
 
-  const code = readFileSync(outfile, 'utf8');
+  const code = readFileSync(target, 'utf8');
   const builtins = new Set([...builtinModules, ...builtinModules.map((m) => `node:${m}`)]);
   const specifiers = [...code.matchAll(/(?:from\s+|import\s*\(\s*|require\s*\(\s*)["']([^"']+)["']/g)].map((m) => m[1]);
   const external = specifiers.filter((s) => !builtins.has(s));
   if (external.length) throw new Error(`CLI bundle has non-builtin imports: ${[...new Set(external)].join(', ')}`);
   const hosts = [...new Set([...code.matchAll(/https?:\/\/([a-z0-9.-]+)/gi)].map((m) => m[1].toLowerCase().replace(/\.+$/, '')))];
   // The site URL is only printed ("upload it at …"); the mock-server test proves it is never requested.
-  const unexpected = hosts.filter((h) => h !== 'api.lemonsqueezy.com' && h !== siteHost);
+  // api.stripe.com: only the optional verification step of `cancel` (BRIEF 2.1).
+  const unexpected = hosts.filter((h) => h !== 'api.lemonsqueezy.com' && h !== 'api.stripe.com' && h !== siteHost);
   if (unexpected.length) throw new Error(`CLI bundle references unexpected hosts: ${unexpected.join(', ')}`);
 
-  const sha256 = createHash('sha256').update(readFileSync(outfile)).digest('hex');
+  const sha256 = createHash('sha256').update(readFileSync(target)).digest('hex');
+  if (target !== outfile) return { outfile: target, sha256, inputs: Object.keys(result.metafile.inputs) };
 
   writeFileSync(
     join(distDir, 'package.json'),

@@ -17,6 +17,11 @@ export function formatDate(value: Date | string): string {
   return new Intl.DateTimeFormat('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' }).format(d);
 }
 
+/** "Nov 26, 2026, 16:02 UTC" */
+export function formatDateTimeUtc(d: Date): string {
+  return `${formatDate(d)}, ${d.toISOString().slice(11, 16)} UTC`;
+}
+
 export function formatPct(value: number | null): string {
   return value === null ? 'n/a' : `${value.toFixed(1)}%`;
 }

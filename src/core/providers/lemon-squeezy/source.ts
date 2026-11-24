@@ -1,8 +1,8 @@
-// LemonSqueezySource (BRIEF 3.1, 5.1). Milestone 1 implements listAccounts + scan.
-// refresh() arrives in Milestone 2 and cancel() in Milestone 3.
+// LemonSqueezySource (BRIEF 3.1, 5.1). The same code runs in the CLI (check, export, cancel) and,
+// for one-time-key and connected campaigns, on the server.
 import type { ScanProgress, SourceAccount, SourceCredentials, SourceProvider, SourceSubscription } from '../types';
 import { createLsClient, LsApiError, type FetchLike, type LsClient, type Sleep } from './client';
-import { asSingleData, parsePrice, parseStore, parseSubscription, type LsPrice } from './guards';
+import { asSingleData, parsePrice, parseStore, parseSubscription, type LsPrice, type LsSubscription } from './guards';
 import { classify, normalizeSubscription } from './normalize';
 import { lemonSqueezyPreset } from './preset';
 
@@ -15,6 +15,79 @@ export type LemonSqueezySourceOptions = {
   now?: () => Date;
   timeoutMs?: number;
 };
+
+type PriceCache = { byId: Map<string, Promise<LsPrice | null>>; byVariant: Map<string, Promise<LsPrice | null>> };
+
+/** A missing or unreadable price makes that row "MRR unknown"; it does not fail the scan. Auth and abort still do. */
+async function softFail(fn: () => Promise<LsPrice | null>): Promise<LsPrice | null> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof LsApiError && (err.kind === 'auth' || err.kind === 'aborted')) throw err;
+    return null;
+  }
+}
+
+export function newestPrice(prices: LsPrice[]): LsPrice | null {
+  const candidates = prices.some((p) => p.category === 'subscription') ? prices.filter((p) => p.category === 'subscription') : prices;
+  let best: LsPrice | null = null;
+  for (const p of candidates) {
+    const tp = p.createdAt?.getTime() ?? -Infinity;
+    const tb = best?.createdAt?.getTime() ?? -Infinity;
+    if (best === null || tp > tb || (tp === tb && Number(p.id) > Number(best.id))) best = p;
+  }
+  return best;
+}
+
+/** The subscription item's price (possibly grandfathered), or the variant's newest price with quantity 1. */
+async function resolvePrice(client: LsClient, sub: LsSubscription, cache: PriceCache, signal?: AbortSignal) {
+  let priceId = sub.firstItem?.priceId ?? null;
+  let price: LsPrice | null = null;
+  if (sub.firstItem && priceId) {
+    const id = priceId;
+    let p = cache.byId.get(id);
+    if (!p) {
+      p = softFail(async () => parsePrice(asSingleData(await client.getJson(`/v1/prices/${encodeURIComponent(id)}`, signal))));
+      cache.byId.set(id, p);
+    }
+    price = await p;
+  } else if (!sub.firstItem && sub.variantId) {
+    const variantId = sub.variantId;
+    let p = cache.byVariant.get(variantId);
+    if (!p) {
+      p = softFail(async () => {
+        const found: LsPrice[] = [];
+        for await (const page of client.paginate(`/v1/prices?filter[variant_id]=${encodeURIComponent(variantId)}&page[size]=100`, signal)) {
+          for (const item of page.data) {
+            const pr = parsePrice(item);
+            if (pr) found.push(pr);
+          }
+        }
+        return newestPrice(found);
+      });
+      cache.byVariant.set(variantId, p);
+    }
+    price = await p;
+    priceId = price?.id ?? null;
+  }
+  return { price, priceId, quantity: sub.firstItem?.quantity ?? 1 };
+}
+
+async function storeCurrency(client: LsClient, accountId: string, signal?: AbortSignal): Promise<string | null> {
+  try {
+    const store = parseStore(asSingleData(await client.getJson(`/v1/stores/${encodeURIComponent(accountId)}`, signal)));
+    return store?.currency ?? null;
+  } catch (err) {
+    if (err instanceof LsApiError && err.kind === 'not_found') return null;
+    throw err;
+  }
+}
+
+async function readSubscription(client: LsClient, id: string, signal?: AbortSignal): Promise<LsSubscription> {
+  const sub = parseSubscription(asSingleData(await client.getJson(`/v1/subscriptions/${encodeURIComponent(id)}`, signal)));
+  if (!sub) throw new LsApiError('bad_response', 'Lemon Squeezy returned an unreadable subscription.');
+  return sub;
+}
 
 export function createLemonSqueezySource(options: LemonSqueezySourceOptions = {}): SourceProvider {
   const now = options.now ?? (() => new Date());
@@ -41,6 +114,33 @@ export function createLemonSqueezySource(options: LemonSqueezySourceOptions = {}
     scan(creds, accountId, onProgress, signal) {
       return scanStore(clientFor(creds), accountId, now(), onProgress, signal);
     },
+
+    /** One subscription, live (connected mode at click time, the CLI before cancelling). */
+    async refresh(creds, sourceSubscriptionId) {
+      const client = clientFor(creds);
+      const signal = AbortSignal.timeout(options.timeoutMs ?? 5_000);
+      const sub = await readSubscription(client, sourceSubscriptionId, signal);
+      const { price, priceId, quantity } = await resolvePrice(client, sub, { byId: new Map(), byVariant: new Map() }, signal);
+      const currency = await storeCurrency(client, sub.storeId, signal);
+      return normalizeSubscription({ sub, price, priceId, quantity, currency, now: now() });
+    },
+
+    /**
+     * DELETE, then read the subscription back: it counts as cancelled only if Lemon Squeezy now
+     * shows it cancelled. (Its docs do not say whether DELETE works for PayPal subscriptions, so
+     * the result is never assumed; see docs/API_NOTES.md.)
+     */
+    async cancel(creds, sourceSubscriptionId) {
+      const client = clientFor(creds);
+      await client.deleteJson(`/v1/subscriptions/${encodeURIComponent(sourceSubscriptionId)}`);
+      const after = await readSubscription(client, sourceSubscriptionId);
+      if (!after.cancelled && after.status !== 'cancelled' && after.status !== 'expired') {
+        throw new LsApiError(
+          'not_cancelled',
+          'Lemon Squeezy did not cancel this subscription. Cancel it by hand in the Lemon Squeezy dashboard.',
+        );
+      }
+    },
   };
 }
 
@@ -52,42 +152,13 @@ async function* scanStore(
   signal: AbortSignal | undefined,
 ): AsyncGenerator<SourceSubscription> {
   const currency = await storeCurrency(client, accountId, signal);
-  const priceById = new Map<string, Promise<LsPrice | null>>();
-  const newestPriceByVariant = new Map<string, Promise<LsPrice | null>>();
-
-  const lookupPrice = (priceId: string) => {
-    let p = priceById.get(priceId);
-    if (!p) {
-      p = softFail(async () => parsePrice(asSingleData(await client.getJson(`/v1/prices/${encodeURIComponent(priceId)}`, signal))));
-      priceById.set(priceId, p);
-    }
-    return p;
-  };
-  const lookupNewestVariantPrice = (variantId: string) => {
-    let p = newestPriceByVariant.get(variantId);
-    if (!p) {
-      p = softFail(async () => {
-        const found: LsPrice[] = [];
-        const path = `/v1/prices?filter[variant_id]=${encodeURIComponent(variantId)}&page[size]=100`;
-        for await (const page of client.paginate(path, signal)) {
-          for (const item of page.data) {
-            const price = parsePrice(item);
-            if (price) found.push(price);
-          }
-        }
-        return newestPrice(found);
-      });
-      newestPriceByVariant.set(variantId, p);
-    }
-    return p;
-  };
-
+  const cache: PriceCache = { byId: new Map(), byVariant: new Map() };
   let pagesFetched = 0;
   let skippedRows = 0;
   const path = `/v1/subscriptions?filter[store_id]=${encodeURIComponent(accountId)}&page[size]=100`;
   for await (const page of client.paginate(path, signal)) {
     pagesFetched += 1;
-    const rows = [];
+    const rows: LsSubscription[] = [];
     for (const item of page.data) {
       const sub = parseSubscription(item);
       if (sub) rows.push(sub);
@@ -99,63 +170,10 @@ async function* scanStore(
       const { stranded, needsReview } = classify(sub);
       // Prices are resolved only for rows anyone will look at: live, non-test, stranded or flagged.
       const wantsPrice = !sub.testMode && (stranded || needsReview !== null);
-      let priceId = sub.firstItem?.priceId ?? null;
-      let price: LsPrice | null = null;
-      if (wantsPrice) {
-        if (sub.firstItem && priceId) {
-          price = await lookupPrice(priceId);
-        } else if (!sub.firstItem && sub.variantId) {
-          // No subscription item (e.g. free trial): the variant's newest price, quantity 1.
-          price = await lookupNewestVariantPrice(sub.variantId);
-          priceId = price?.id ?? null;
-        }
-      }
-      yield normalizeSubscription({
-        sub,
-        price,
-        priceId,
-        quantity: sub.firstItem?.quantity ?? 1,
-        currency,
-        now: scanNow,
-      });
+      const resolved = wantsPrice
+        ? await resolvePrice(client, sub, cache, signal)
+        : { price: null, priceId: sub.firstItem?.priceId ?? null, quantity: sub.firstItem?.quantity ?? 1 };
+      yield normalizeSubscription({ sub, ...resolved, currency, now: scanNow });
     }
   }
-}
-
-async function storeCurrency(client: LsClient, accountId: string, signal?: AbortSignal): Promise<string | null> {
-  try {
-    const store = parseStore(asSingleData(await client.getJson(`/v1/stores/${encodeURIComponent(accountId)}`, signal)));
-    return store?.currency ?? null;
-  } catch (err) {
-    if (err instanceof LsApiError && err.kind === 'not_found') return null;
-    throw err;
-  }
-}
-
-/** A missing or unreadable price makes that row "MRR unknown"; it does not fail the scan. Auth and abort still do. */
-async function softFail(fn: () => Promise<LsPrice | null>): Promise<LsPrice | null> {
-  try {
-    return await fn();
-  } catch (err) {
-    if (err instanceof LsApiError && (err.kind === 'auth' || err.kind === 'aborted')) throw err;
-    return null;
-  }
-}
-
-export function newestPrice(prices: LsPrice[]): LsPrice | null {
-  const candidates = prices.some((p) => p.category === 'subscription')
-    ? prices.filter((p) => p.category === 'subscription')
-    : prices;
-  let best: LsPrice | null = null;
-  for (const p of candidates) {
-    if (best === null || compareNewest(p, best) > 0) best = p;
-  }
-  return best;
-}
-
-function compareNewest(a: LsPrice, b: LsPrice): number {
-  const ta = a.createdAt?.getTime() ?? -Infinity;
-  const tb = b.createdAt?.getTime() ?? -Infinity;
-  if (ta !== tb) return ta - tb;
-  return Number(a.id) - Number(b.id);
 }
