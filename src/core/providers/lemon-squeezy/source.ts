@@ -1,10 +1,10 @@
 // LemonSqueezySource (BRIEF 3.1, 5.1). The same code runs in the CLI (check, export, cancel) and,
 // for one-time-key and connected campaigns, on the server.
-import type { ScanProgress, SourceAccount, SourceCredentials, SourceProvider, SourceSubscription } from '../types';
+import type { ProviderPreset, ScanProgress, SourceAccount, SourceCredentials, SourceProvider, SourceSubscription } from '../types';
 import { createLsClient, LsApiError, type FetchLike, type LsClient, type Sleep } from './client';
 import { asSingleData, parsePrice, parseStore, parseSubscription, type LsPrice, type LsSubscription } from './guards';
 import { classify, normalizeSubscription } from './normalize';
-import { lemonSqueezyPreset } from './preset';
+import { lemonSqueezyPresetBase } from './preset-base';
 
 export const LEMON_SQUEEZY_ID = 'lemon_squeezy';
 
@@ -14,6 +14,8 @@ export type LemonSqueezySourceOptions = {
   sleep?: Sleep;
   now?: () => Date;
   timeoutMs?: number;
+  /** The site passes the full preset (./preset.ts); the CLI keeps the base, so site copy is not bundled. */
+  preset?: ProviderPreset;
 };
 
 type PriceCache = { byId: Map<string, Promise<LsPrice | null>>; byVariant: Map<string, Promise<LsPrice | null>> };
@@ -97,7 +99,7 @@ export function createLemonSqueezySource(options: LemonSqueezySourceOptions = {}
   return {
     id: LEMON_SQUEEZY_ID,
     capabilities: { supportsLiveRefresh: true, supportsApiCancel: true, requiresApiKey: true },
-    preset: lemonSqueezyPreset,
+    preset: options.preset ?? lemonSqueezyPresetBase,
 
     async listAccounts(creds, signal) {
       const client = clientFor(creds);

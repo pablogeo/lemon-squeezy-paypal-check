@@ -17,14 +17,11 @@ export const SITE_URL = 'https://relinkpay.com';
 export const CLI_FILE_NAME: string = cliConfig.fileName;
 export const CLI_VERSION: string = cliConfig.version;
 
-/** Flip to true once the legal pages have been reviewed; until then they carry a "draft" notice. */
-export const LEGAL_PAGES_REVIEWED = false;
 
 export const GUARANTEE_TERMS =
   'Full refund if fewer than 3 subscribers re-home (campaigns of 10+ subscribers, requested within 30 days of launch).';
 
-export const SUPPORT_TERMS =
-  'Email support, replies within 3 business days. No live support and no guaranteed response times.';
+export const SUPPORT_TERMS = 'Replies within 1 business day.';
 
 export type TierId = 'starter' | 'growth' | 'pro';
 

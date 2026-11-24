@@ -4,6 +4,8 @@ Lemon Squeezy stops processing payments, including renewals, on **March 31, 2027
 
 From December 2, 2026, Lemon Squeezy's Migration Hub flags the customers who need to act. This script adds what you need to plan around them: the **monthly revenue at stake**, which **plans** they are on, and the **week each subscriber's paid period ends**. It can also export those subscribers to a file for a re-subscription campaign.
 
+Made by **[ReLink](https://relinkpay.com)**, which runs that campaign for you: a personal link per PayPal subscriber to Stripe Checkout in your own account (first charge on the date they have already paid through), reminder emails from your own email account, and dated cancel lists so nobody pays twice. Step-by-step plan, whether or not you use ReLink: [What to do with your Lemon Squeezy PayPal subscribers](https://relinkpay.com/guides/lemon-squeezy-paypal-subscribers). The script itself never contacts relinkpay.com.
+
 - One file, unminified, **no dependencies**. Read it before you run it.
 - Talks **only** to `https://api.lemonsqueezy.com`, plus `https://api.stripe.com` (read-only, your restricted key) when `cancel` verifies new subscriptions. Never contacts any other server, ours included.
 - Never writes your API keys to disk.
