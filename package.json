@@ -1,0 +1,17 @@
+{
+  "name": "lemon-squeezy-paypal-check-source",
+  "version": "0.2.1",
+  "private": true,
+  "description": "Source and reproducible build of the Lemon Squeezy PayPal subscriber check CLI.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "node cli/build.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

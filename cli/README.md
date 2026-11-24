@@ -1,0 +1,72 @@
+# Lemon Squeezy PayPal subscriber check (CLI)
+
+Lemon Squeezy stops processing payments, including renewals, on **March 31, 2027**. Card subscriptions can be migrated, but **PayPal subscriptions cannot**: every PayPal subscriber has to buy a new subscription.
+
+From December 2, 2026, Lemon Squeezy's Migration Hub flags the customers who need to act. This script adds what you need to plan around them: the **monthly revenue at stake**, which **plans** they are on, and the **week each subscriber's paid period ends**. It can also export those subscribers to a file for a re-subscription campaign.
+
+- One file, unminified, **no dependencies**. Read it before you run it.
+- Talks **only** to `https://api.lemonsqueezy.com`. Never contacts any other server, ours included.
+- Never writes your API key to disk.
+- Node.js 18 or later.
+
+## Run it
+
+1. In Lemon Squeezy, go to **Settings → API** and create a new **live-mode** key. Lemon Squeezy keys are full-access, so create one just for this and delete it when you are done.
+2. Run the check:
+
+```sh
+node lemon-squeezy-paypal-check.mjs
+```
+
+Paste the key at the hidden prompt, or set it first:
+
+```sh
+LEMONSQUEEZY_API_KEY=... node lemon-squeezy-paypal-check.mjs
+```
+
+```powershell
+$env:LEMONSQUEEZY_API_KEY = "..."; node lemon-squeezy-paypal-check.mjs
+```
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `check` (default) | Prints the report. `--json` for machine-readable output. Nothing leaves your machine. |
+| `export --out stranded.json` | Writes the stranded subscribers of one store to a file (readable only by you) that you upload to your campaign. Add `--store <id>` if your key sees more than one store. |
+
+The export contains customer names and emails, plan, price and renewal dates for subscribers who must re-subscribe (plus paused or unpaid PayPal subscriptions, flagged for review). It never contains your API key or test-mode subscriptions. Upload it only in your campaign.
+
+## What the report shows
+
+Per store:
+
+- **PayPal subscribers who must re-subscribe**: `payment_processor` is `paypal`, not cancelled, and status `active`, `on_trial` or `past_due`.
+- **Monthly revenue at stake**: list price, in store currency, before discounts and tax. Yearly, weekly and daily plans are converted to a monthly figure. Usage-based and tiered prices are counted separately, not guessed.
+- **By plan**, and **by the week each subscriber's paid period ends**, up to the cutoff.
+- How many are **already paid through beyond the cutoff**.
+- **Needs a look**, listed separately and not in the headline number: paused or unpaid PayPal subscriptions, and Stripe-processed subscriptions paid without a card (only relevant if you are leaving Stripe).
+
+Test-mode subscriptions are ignored. If the key only sees test-mode data, the script says so.
+
+## Verify the file
+
+Every release publishes the file's SHA-256 here and on the website. Compare before running:
+
+```sh
+shasum -a 256 lemon-squeezy-paypal-check.mjs
+```
+
+```powershell
+Get-FileHash lemon-squeezy-paypal-check.mjs -Algorithm SHA256
+```
+
+## Exit codes
+
+`0` success · `1` error · `2` bad usage, rejected key, or test-mode key · `130` cancelled.
+
+## Licence
+
+MIT. See `LICENSE`.
+
+Not affiliated with Lemon Squeezy, Stripe, or PayPal.
